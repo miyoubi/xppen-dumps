@@ -2,6 +2,7 @@
 """No-smoothing firmware builder for XP-Pen G640 (Variant 2), IC 901 (PIC32 / MIPS32 LE).
 
 Run with no arguments, or with -h / --help, to print the instructions.
+Options: --square  add a small square dead-zone (see HELP).
 Tested on a G640 Variant 2: works. Back up first anyway. Every edit verifies the original bytes
 and refuses to run on any other image.
 """
@@ -23,8 +24,9 @@ HOW TO USE IT, STEP BY STEP
       cp "xppen-dumps-main/stock/G640 (Variant 2)/ic901-code.bin" .
 
  3. Build the patched firmware
-      python3 make_patch.py ic901-code.bin
-    This writes g640v2-nosmooth.hex (and .bin) in the current directory.
+      python3 make_patch.py ic901-code.bin            fully raw, no dead-zone (cursor shakes at rest)
+      python3 make_patch.py ic901-code.bin --square   same, plus a small SQUARE dead-zone while the pen is still
+    This writes g640v2-nosmooth.hex (or g640v2-nosmooth-square.hex) in the current directory.
     It refuses to run on any file that is not the stock Variant 2 image.
 
  4. Check the tablet is connected and what it is
@@ -39,11 +41,34 @@ HOW TO USE IT, STEP BY STEP
       sudo ./xppen-tools dfu
 
  7. Flash. Do NOT unplug the tablet while it writes.
-      sudo ./xppen-tools update g640v2-nosmooth.hex
+      sudo ./xppen-tools update g640v2-nosmooth.hex      (or g640v2-nosmooth-square.hex)
 
  8. Check the result
       sudo ./xppen-tools monitor
     Draw on the tablet and watch the pen state and report rate.
+
+IF SOMETHING GOES WRONG
+  - Leave DFU mode without flashing:   sudo ./xppen-tools exit-dfu
+  - Restore stock firmware:            sudo ./xppen-tools update "xppen-dumps-main/stock/G640 (Variant 2)/ic901-stock.hex"
+    (or flash your backup)
+
+OPTIONS
+  (none)     Fully raw. Every position the tablet measures goes straight to the cursor.
+             Nothing is averaged and nothing is held back, so the cursor wobbles a few counts
+             at rest (100 counts = about 1 mm). 37 bytes changed.
+
+  --square   Same as above, plus a small dead-zone while the pen is nearly still. 82 bytes changed.
+             How it works:
+               - A dead-zone ignores tiny pen movements so the cursor sits still instead of shaking.
+                 Once the pen moves further than the dead-zone, the real position is used
+                 immediately, with no delay or blending.
+               - The size of the dead-zone depends on pen speed and comes from a 16-entry table
+                 (SQUARE_TABLE in this script): 8,7,6,5,4,3,2,1,0,0,... Slow pen = about 8 counts
+                 (0.08 mm), fast pen = none. The slow-to-fast order is assumed.
+               - The shape: stock firmware adds the X change and the Y change (a diamond).
+                 --square instead takes the larger of the two (a square). A move is ignored only if
+                 BOTH the X change and the Y change are smaller than the dead-zone size.
+               - To change the size, edit the numbers in SQUARE_TABLE and run again.
 """
 
 # (address, expected original bytes, new bytes, description)
@@ -55,9 +80,24 @@ EDITS = [
 ] + [(a, "dd8482a3", "00000000", "out-of-area sample no longer sets pen state 3")
      for a in (0x1D007FB8, 0x1D007FE4, 0x1D008024, 0x1D008050)]
 
-def build(data):
+# --square: small dead-zone table + hold check rewritten from |dX|+|dY| (diamond) to max(|dX|,|dY|) (square).
+SQUARE_TABLE = bytes([8,7,6,5,4,3,2,1,0,0,0,0,0,0,0,0])
+SQUARE_HOLD_OLD = (  # stock 0x1D0076F8..0x1D007733, 15 instructions
+    "ff008430fc84838fac858a8fd885828fac84898f23404900"
+    "c33f08002640e8002338070123306a00c32f06002630a600"
+    "2328c5002128e5002a28a400")
+SQUARE_HOLD_NEW = (  # lw x4, |dY| -> a3, |dX| -> a1, a1 = max(a3,a1) < a0
+    "fc84838fac858a8fd885828fac84898f23404900c33f0800"
+    "2640e8002338070123306a00c32f06002630a6002328c500"
+    "2a30e5000b38a6002a28e400")
+
+def build(data, square=False):
+    edits = list(EDITS)
+    if square:
+        edits[1] = (edits[1][0], edits[1][1], SQUARE_TABLE.hex(), "small dead-zone table")
+        edits.append((0x1D0076F8, SQUARE_HOLD_OLD, SQUARE_HOLD_NEW, "hold check: |dX|+|dY| -> max(|dX|,|dY|)"))
     out, seen = bytearray(data), set()
-    for addr, old, new, why in EDITS:
+    for addr, old, new, why in edits:
         o, n = addr - BASE, len(old) // 2
         assert not (set(range(o, o + n)) & seen), f"overlap at {addr:#x}"
         seen |= set(range(o, o + n))
@@ -80,11 +120,14 @@ def to_ihex(code, base=BASE):
     return "".join(out) + ":00000001FF\n"
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2 or sys.argv[1] in ("-h", "--help", "help"):
+    args = [a for a in sys.argv[1:] if a != "--square"]
+    if len(args) != 1 or args[0] in ("-h", "--help", "help"):
         print(HELP)
-        sys.exit(0 if len(sys.argv) == 1 or sys.argv[1] in ("-h", "--help", "help") else 1)
-    d = open(sys.argv[1], "rb").read()
+        sys.exit(0 if len(sys.argv) == 1 or args[:1] in (["-h"], ["--help"], ["help"]) else 1)
+    square = "--square" in sys.argv
+    d = open(args[0], "rb").read()
     assert len(d) == SIZE, "wrong size - this is not the G640 Variant 2 IC901 application image"
-    b = build(d)
-    open("g640v2-nosmooth.hex", "w").write(to_ihex(b))
-    print(f"wrote g640v2-nosmooth.hex  sha256 {hashlib.sha256(b).hexdigest()[:16]}  {sum(x != y for x, y in zip(d, b))} bytes changed")
+    b = build(d, square)
+    name = "g640v2-nosmooth-square" if square else "g640v2-nosmooth"
+    open(f"{name}.hex", "w").write(to_ihex(b))
+    print(f"wrote {name}.hex  sha256 {hashlib.sha256(b).hexdigest()[:16]}  {sum(x != y for x, y in zip(d, b))} bytes changed")
