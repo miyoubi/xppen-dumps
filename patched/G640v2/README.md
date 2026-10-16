@@ -2,6 +2,8 @@
 
 Removes the position smoothing from the XP-Pen G640 **Variant 2** firmware (IC 901, PIC32 / MIPS32 LE).
 
+> **Tested on a G640 Variant 2: works.** A bad or interrupted flash can still brick the tablet. Back up first and use at your own risk.
+
 ## Compatibility
 
 | Item | Value |
@@ -17,18 +19,16 @@ Removes the position smoothing from the XP-Pen G640 **Variant 2** firmware (IC 9
 
 | File | Description |
 | --- | --- |
-| `g640v2-nosmooth.hex` | **Default.** No averaging and no dead-zone. The cursor will shake at rest. |
-| `g640v2-normal.hex` | Same, plus a small dead-zone while the pen is still, to stop the shake. |
-| `make_patch.py` | Builds either image from the stock `ic901-code.bin`. |
+| `g640v2-nosmooth.hex` | Ready to flash. |
+| `make_patch.py` | Builds the same image from the stock `ic901-code.bin`. |
 
 ## Build
 
 ```sh
-python3 make_patch.py ic901-code.bin out            # out/g640v2-nosmooth.{bin,hex}
-python3 make_patch.py ic901-code.bin out --normal   # out/g640v2-normal.{bin,hex}
+python3 make_patch.py ic901-code.bin
 ```
 
-The stock `ic901-code.bin` is in the dumps repo under `stock/G640 (Variant 2)/`.
+Writes `g640v2-nosmooth.hex` to the current directory. The stock `ic901-code.bin` is in the dumps repo under `stock/G640 (Variant 2)/`.
 
 ## Flash
 
@@ -67,7 +67,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 | Edit | Address | Stock | Patched | Effect |
 | --- | --- | --- | --- | --- |
 | Window | `0x1D0099D4` | `e884868f` | `01000624` | Averaging window forced to 1 sample (stock: 5 to 40, chosen by pen speed). This is the main smoothing. |
-| Hold | `0x1D018770` (16 B) | `80,70,50,50,50,45,45,45,45,45,45,35,30,25,20,15` | nosmooth: all `0`<br>normal: `32,28,20,14,10,8,6,4,3,2,0,0,0,0,0,0` | Dead-zone table. |
+| Hold | `0x1D018770` (16 B) | `80,70,50,50,50,45,45,45,45,45,45,35,30,25,20,15` | all `0` | Dead-zone table. |
 | Move flag | `0x1D009740` | `3200432c` | `0000432c` | "Pen moving" threshold 50 to 0. |
 | No-edge | `0x1D007FB8`, `7FE4`, `8024`, `8050` | `dd8482a3` | `00000000` | One raw sample outside the active area no longer sets pen state 3, which produced single `X=0 Y=0` reports. |
 
@@ -85,8 +85,6 @@ The 3 ms bInterval on EP82 is a polling ceiling (about 333 Hz), not a report rat
 
 ## Known limits
 
-- The dead-zone table's slow-to-fast order is assumed, not confirmed.
-- Move flag and no-edge are not confirmed to fix any specific dropout.
 - Only the X/Y path was patched. Pressure may still be smoothed.
 - With filtering removed, raw sensor noise reaches the cursor (a few counts, 100 counts is about 1 mm).
 
@@ -94,6 +92,6 @@ The 3 ms bInterval on EP82 is a polling ceiling (about 333 Hz), not a report rat
 
 | Symptom | Fix |
 | --- | --- |
-| Cursor shakes at rest | Flash `normal`. If it still shakes, raise the dead-zone values at `0x1D018770`. |
+| Cursor shakes at rest | Expected, since there is no dead-zone. Raise the dead-zone values at `0x1D018770` to add one. |
 | Pen stops working | Flash the stock hex or your backup. |
 | `X=0 Y=0` lines in `xppen-tools monitor` while hovering | Expected to be fixed by the no-edge edit. If not, it is a separate cause. |
