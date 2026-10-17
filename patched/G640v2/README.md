@@ -37,9 +37,12 @@ The script writes one `.hex` file, named after the options you chose. It does no
 | `--pressure` | Experimental, untested. Stops the firmware cutting pressure to 66% for a few frames after touch-down. |
 | `--burst N` | Experimental. Carrier cycles the antenna is driven per scan step (stock 35). Lower values scan a little faster but give a weaker signal. |
 | `--adc-fast` | Runs the ADC conversion clock twice as fast. Raises the scan rate without weakening the signal. The ADC clock ends up faster than its rated minimum, but it worked on a real G640 V2. |
+| `--smooth N` | Optional, off by default. Light smoothing, N = 2 to 8, instead of the base build's window of 1 (stock was about 11 samples while touching). Not tested on a tablet. |
+| `--hover-hold N` | Experimental. Fixed hold of N counts (100 = about 1 mm) while the pen hovers, to stop the hover cursor twitching. No averaging, no lag, and pen-down behaviour is unchanged. Try 30 to 40. |
+| `--sample-wait N` | Experimental, did not help. ADC sample-and-hold wait in timer ticks (60 = 1 us, stock 2). N = 1 to 30. Tested 6 and 12 on the square-12 base; both were worse. Not recommended. |
 | `--poll` | Sets USB polling to 1 ms (stock 3 ms for the pen). Removes the 333 Hz host-side ceiling. It does not speed up the scan. |
 | `--settle N` | Experimental. Wait between the end of the drive burst and the first ADC reading, in microseconds (stock 15). Only 12 to 15 is accepted, because 8 stopped pen detection on a real G640 V2. |
-| `--flash-fast` | Experimental, untested, riskier than the others. Sets flash wait states and prefetch at startup (see below). |
+| `--flash-fast` | Experimental, riskier than the others, and **not recommended**: flashed on a real G640 V2 with no noticeable difference. Sets flash wait states and prefetch at startup (see below). |
 
 Examples:
 
@@ -126,11 +129,33 @@ sudo udevadm trigger
 | `--adc-fast` | `0x1D00CDD4` | AD1CON3 ADCS 1 to 0 (1 byte). |
 | `--settle N` | `0x1D01866C`, `0x1D019D98` | Boot image 10, startup overwrites with 15, so both places are set. |
 | `--poll` | `0x1D018D45`, `0x1D018D5E`, `0x1D018D77` | USB `bInterval` for EP81, EP82 (pen) and EP83 set to 1 ms. |
+| `--hover-hold N` | `0x1D007C20`, `0x1D007CEC`, `0x1D007DB8` | The three hover-branch threshold loads (`lbu a0`) become `addiu a0,zero,N`. |
+| `--sample-wait N` | `0x1D0182FC` | The `sltiu v0,v0,2` in the ADC sample wait loop becomes `sltiu v0,v0,N`, so the wait goes from 2 ticks to N. |
+| `--smooth N` | `0x1D0099D4` | `lw a2` becomes `addiu a2,zero,N` instead of `addiu a2,zero,1`. |
 | `--flash-fast` | `0x1D007038` (16 bytes) | See below. |
+
+### `--hover-hold N`
+
+The hold routine at `0x1D0076F8` skips a report while the pen is within a threshold of the last reported point. Its threshold comes from a 16-entry speed table, and the pen-down and hover branches share that table. The stock table held 80 counts at rest, and hover also had a 25-sample average. The no-smoothing build holds only 8, but `xppen-tools monitor` on a real G640 V2 showed hover noise of about 15 to 25 counts (peak-to-peak 55 to 80 in the quietest windows), so the cursor moved on almost every report.
+
+The code at `0x1D0078E4` sends pressure 0 to the hover branch at `0x1D007B58`. That branch has three call sites of the hold routine, and each loads its threshold with `lbu a0,-0x7b2c(gp)` in the delay slot. This option replaces those three loads with a constant.
+
+I ran the real hold routine in a Unicorn emulator with 16 counts of noise and the pen still:
+
+| Hover hold | Reports where the position changes |
+| --- | --- |
+| 8 (base build) | 89% |
+| 20 | 43% |
+| 30 | 16% |
+| 40 | 4% |
+
+Slow hovering moves are reported in steps of about N counts, and a move bigger than N goes through at once. These are simulation results on synthetic noise, not a measurement of the pen-down behaviour or of a tablet.
 
 ### `--flash-fast`
 
 The loader enters the app at `0x1D007000`, which falls into the startup code. Nothing in the boot flash, loader or app writes the flash control register (CHECON, `0xBF884000`), and the startup code only calls empty functions where the usual compiler startup configures it. For this chip family the reset state is prefetch off and 7 flash wait states, so code runs slowly.
+
+**Status: flashed on a real G640 V2 with no noticeable difference. Not recommended.** No rate measurement was taken, so the effect, if any, is small. Two points argue that the CPU is not what limits the scan: the rate barely changed between `--burst` 5, 12 and 15 even though the carrier interrupt handler (about 90 instructions per carrier cycle) would dominate the burst at 7 wait states, and nothing in the app waits on CPU speed alone, because every timing wait is a busy-loop on a hardware timer. The register address and reset value for this exact chip were not confirmed.
 
 The option replaces an empty function call at `0x1D007038` with four instructions that write CHECON = `0x33`: 3 wait states and prefetch on. The scan timers are unchanged.
 
@@ -144,8 +169,10 @@ Full speed (12 Mb/s) allows a minimum polling interval of 1 ms, so the host can 
 
 - **Tested on hardware:** the no-smoothing base with `--square` (default size 8): a still pen held its position and passed no movement under about 8 counts. `--burst 15 --adc-fast --poll` ran at about 330 Hz.
 - **Failed on hardware:** `--settle 8` stopped pen detection (the tablet still enumerated and was recovered by reflashing).
-- **Not tested on hardware:** other dead-zone sizes, `--pressure`, `--settle 12` to `15`, `--flash-fast`, and `--burst` values other than 15. The dead-zone table values and their order are assumptions.
-- **Scan rate:** the scan stopped getting faster once burst and ADC time were reduced (about 315 to 330 Hz across several settings). The remaining limit is not confirmed. `--flash-fast` is the untested attempt to find out whether the CPU is it.
+- **Tested on hardware, no noticeable effect:** `--flash-fast`.
+- **Sample wait:** `--sample-wait 6` and `12` made the shake worse on hardware (user report). `1` is built but untested.
+- **Not tested on hardware:** other dead-zone sizes, `--pressure`, `--settle 12` to `15`, `--smooth`, and `--burst` values other than 15. The dead-zone table values and their order are assumptions.
+- **Scan rate:** the scan stopped getting faster once burst and ADC time were reduced (about 315 to 330 Hz across several settings). The remaining limit is not confirmed. `--flash-fast` was the attempt to find out whether the CPU is the limit; it made no noticeable difference.
 - **Weak signal:** a low `--burst` weakens the pen signal. Watch for jitter at rest, dropouts near the edges or at hover height, and the pen cutting out on light touches.
 - **Pressure** may still be smoothed. Only the X/Y position path was changed.
 - **Out-of-area samples:** two or more bad readings in a row can still cause a short dropout.

@@ -2,7 +2,7 @@
 """No-smoothing firmware builder for XP-Pen G640 (Variant 2), IC 901 (PIC32 / MIPS32 LE).
 
 Run with no arguments, or with -h / --help, to print the instructions.
-Options: --deadzone N (dead-zone size), --square (square shape), --pressure, --burst N, --adc-fast, --settle N, --flash-fast, --poll. See HELP.
+Options: --deadzone N (dead-zone size), --square (square shape), --pressure, --burst N, --adc-fast, --settle N, --flash-fast, --smooth N, --hover-hold N, --poll. See HELP.
 Tested on a G640 Variant 2: works. Back up first anyway. Every edit verifies the original bytes
 and refuses to run on any other image.
 """
@@ -92,7 +92,8 @@ OPTIONS
       -> g640v2-nosmooth-square-burst-15-adc-settle-12-poll.hex
 
   --flash-fast
-      Add-on, EXPERIMENTAL and untested. The stock firmware never sets the
+      Add-on, EXPERIMENTAL. Flashed on a real G640 V2: no noticeable difference
+      (no rate measurement was taken). Not recommended: see README. The stock firmware never sets the
       chip's flash wait states or prefetch (CHECON register), so after reset
       every instruction is fetched from flash at 7 wait states with no
       prefetch. This sets 3 wait states and turns prefetch on, so all code
@@ -106,6 +107,37 @@ OPTIONS
       and be ready to accept that risk.
         python3 make_patch.py ic901-code.bin --square --burst 15 --adc-fast --poll --flash-fast
       -> g640v2-nosmooth-square-burst-15-adc-flash-poll.hex
+
+  --smooth N
+      Add-on, OPTIONAL, off by default (the builds above have no smoothing).
+      Light smoothing against chatter, N = 2 to 8. The base build forces the
+      stock moving average to a window of 1. The stock firmware used about 11
+      samples while the pen touches (roughly 30 ms of lag). This sets a small
+      fixed window instead, using the firmware's own averaging code. Changes 4
+      bytes (the same instruction the base build already changes). Emulator
+      results (6 counts of noise, 30 counts per sample of pen speed):
+        N=2: rest noise -44%, lag 1 sample  (~3 ms at 330 Hz)
+        N=3: rest noise -57%, lag 2 samples (~6 ms)
+        N=4: rest noise -63%, lag 3 samples (~9 ms)
+      Not tested on a real tablet.
+        python3 make_patch.py ic901-code.bin --square --burst 15 --adc-fast --poll --smooth 3
+      -> g640v2-nosmooth-square-burst-15-adc-smooth-3-poll.hex
+
+  --hover-hold N
+      Add-on, EXPERIMENTAL. Calms the cursor while the pen hovers (pressure 0)
+      and does not touch pen-down behaviour. N = 1 to 255 counts (100 = about
+      1 mm). The stock firmware held the hover cursor for up to 80 counts and
+      averaged 25 samples. The no-smoothing build holds only 8, but hover noise
+      measured on a real G640 V2 is about 15 to 25 counts, so the cursor moved
+      on almost every report. This sets the hover hold to a fixed N instead.
+      The hold only skips a report while the pen is within N counts (in both X
+      and Y) of the last reported point, so there is no averaging and no lag;
+      a move bigger than N goes through at once. Simulation of the real hold
+      routine with 16 counts of noise, pen still: the reported position changed
+      on 89% of reports at hold 8, 43% at 20, 16% at 30, 4% at 40. Slowly
+      hovering moves are reported in steps of about N counts. Changes 12 bytes.
+        python3 make_patch.py ic901-code.bin --square --burst 15 --adc-fast --poll --hover-hold 40
+      -> g640v2-nosmooth-square-burst-15-adc-hover-40-poll.hex
 
   -h, --help
       Show this message.
@@ -176,14 +208,33 @@ SQUARE_HOLD_NEW = (  # lw x4, |dY| -> a3, |dX| -> a1, a1 = max(a3,a1) < a0
     "2640e8002338070123306a00c32f06002630a6002328c500"
     "2a30e5000b38a6002a28e400")
 
-def build(data, deadzone=None, square=False, pressure=False, burst=None, adc_fast=False, poll=False, settle=None, flash_fast=False):
+# --smooth N: the base build forces the averaging window to 1 by replacing "lw a2,-0x7b18(gp)" at 0x1D0099D4 with
+# "addiu a2,zero,1". "addiu a2,zero,N" gives a fixed N-sample window through the stock averaging code (exponential-style,
+# alpha = 1/N, lag N-1 samples). Optional, off by default.
+def smooth_edit(n):
+    return (0x1D0099D4, "e884868f", f"{n:02x}000624", f"averaging window = {n} samples (light smoothing)")
+
+# --hover-hold N: the hold function at 0x1D0076F8 takes its threshold in a0. Six call sites load it from the speed table
+# result (lbu a0,-0x7b2c(gp) in the delay slot of each jal): 0x1D0079B4, 0x1D007A80, 0x1D007B4C are in the pen-down branch,
+# 0x1D007C20, 0x1D007CEC, 0x1D007DB8 are in the hover branch (the code at 0x1D0078E4 branches to 0x1D007B58 when the
+# pressure at 0xA0000DA8 is 0). Replacing the three hover loads with "addiu a0,zero,N" gives hover a fixed hold of N counts.
+HOVER_SITES = (0x1D007C20, 0x1D007CEC, 0x1D007DB8)
+def hover_edits(n):
+    return [(a, "d4848493", f"{n:02x}000424", f"hover hold threshold = {n} counts") for a in HOVER_SITES]
+
+SAMPLE_WAIT = None
+
+def build(data, deadzone=None, square=False, pressure=False, burst=None, adc_fast=False, poll=False, settle=None, flash_fast=False, smooth=None, hover_hold=None):
     edits = list(EDITS)
+    if hover_hold is not None: edits += hover_edits(hover_hold)
+    if smooth is not None: edits[0] = smooth_edit(smooth)
     if poll: edits += POLL
     if adc_fast: edits += ADC_FAST
     if flash_fast: edits += FLASH_FAST
     if settle is not None: edits += settle_edits(settle)
     if burst is not None: edits += burst_edits(burst)
     if pressure: edits += PRESSURE
+    if SAMPLE_WAIT is not None: edits.append((0x1D0182FC, "0200422c", f"{SAMPLE_WAIT:02x}00422c", f"ADC sample wait = {SAMPLE_WAIT} ticks (stock 2 = 33 ns)"))
     if deadzone is not None:
         edits[1] = (edits[1][0], edits[1][1], square_table(deadzone).hex(), "dead-zone table")
     if square:
@@ -212,7 +263,7 @@ def to_ihex(code, base=BASE):
     return "".join(out) + ":00000001FF\n"
 
 if __name__ == "__main__":
-    argv, deadzone, square, pressure, burst, adc_fast, poll, settle, flash_fast, args, i = sys.argv[1:], None, False, False, None, False, False, None, False, [], 0
+    argv, deadzone, square, pressure, burst, adc_fast, poll, settle, flash_fast, smooth, hover_hold, args, i = sys.argv[1:], None, False, False, None, False, False, None, False, None, None, [], 0
     while i < len(argv):
         if argv[i] == "--square":
             square = True
@@ -222,6 +273,14 @@ if __name__ == "__main__":
             adc_fast = True
         elif argv[i] == "--flash-fast":
             flash_fast = True
+        elif argv[i] == "--hover-hold":
+            if i + 1 >= len(argv) or not argv[i + 1].isdigit() or not 1 <= int(argv[i + 1]) <= 255:
+                sys.exit("--hover-hold needs a whole number from 1 to 255 (counts, 100 is about 1 mm)")
+            hover_hold = int(argv[i + 1]); i += 1
+        elif argv[i] == "--smooth":
+            if i + 1 >= len(argv) or not argv[i + 1].isdigit() or not 2 <= int(argv[i + 1]) <= 8:
+                sys.exit("--smooth needs a whole number from 2 to 8 (averaging window in samples; the default build uses 1)")
+            smooth = int(argv[i + 1]); i += 1
         elif argv[i] == "--sampc":
             sys.exit("--sampc was removed: the ADC sample time field is not used by this firmware (manual conversion), so it did nothing")
         elif argv[i] == "--settle":
@@ -230,6 +289,10 @@ if __name__ == "__main__":
             settle = int(argv[i + 1]); i += 1
         elif argv[i] == "--poll":
             poll = True
+        elif argv[i] == "--sample-wait":
+            if i + 1 >= len(argv) or not argv[i + 1].isdigit() or not 1 <= int(argv[i + 1]) <= 30:
+                sys.exit("--sample-wait needs a whole number from 1 to 30 (timer ticks, 60 = 1 us, stock 2)")
+            SAMPLE_WAIT = int(argv[i + 1]); i += 1
         elif argv[i] == "--burst":
             if i + 1 >= len(argv) or not argv[i + 1].isdigit() or not 1 <= int(argv[i + 1]) <= 255:
                 sys.exit("--burst needs a whole number from 1 to 255 (stock is 35)")
@@ -248,11 +311,11 @@ if __name__ == "__main__":
         sys.exit(0 if not argv or args[:1] in (["-h"], ["--help"], ["help"]) else 1)
     d = open(args[0], "rb").read()
     assert len(d) == SIZE, "wrong size - this is not the G640 Variant 2 IC901 application image"
-    b = build(d, deadzone, square, pressure, burst, adc_fast, poll, settle, flash_fast)
+    b = build(d, deadzone, square, pressure, burst, adc_fast, poll, settle, flash_fast, smooth, hover_hold)
     if deadzone is None: name = "g640v2-nosmooth"
     elif square and deadzone == DEFAULT_DEADZONE: name = "g640v2-nosmooth-square"
     elif square: name = f"g640v2-nosmooth-square-{deadzone}"
     else: name = f"g640v2-nosmooth-deadzone-{deadzone}"
-    name += ("-pressure" if pressure else "") + (f"-burst-{burst}" if burst is not None else "") + ("-adc" if adc_fast else "") + (f"-settle-{settle}" if settle is not None else "") + ("-flash" if flash_fast else "") + ("-poll" if poll else "")
+    name += ("-pressure" if pressure else "") + (f"-burst-{burst}" if burst is not None else "") + ("-adc" if adc_fast else "") + (f"-settle-{settle}" if settle is not None else "") + ("-flash" if flash_fast else "") + (f"-smooth-{smooth}" if smooth is not None else "") + (f"-hover-{hover_hold}" if hover_hold is not None else "") + (f"-sw-{SAMPLE_WAIT}" if SAMPLE_WAIT is not None else "") + ("-poll" if poll else "")
     open(f"{name}.hex", "w").write(to_ihex(b))
     print(f"wrote {name}.hex  sha256 {hashlib.sha256(b).hexdigest()[:16]}  {sum(x != y for x, y in zip(d, b))} bytes changed")
