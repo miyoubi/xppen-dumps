@@ -2,7 +2,7 @@
 """No-smoothing firmware builder for XP-Pen G640 (Variant 2), IC 901 (PIC32 / MIPS32 LE).
 
 Run with no arguments, or with -h / --help, to print the instructions.
-Options: --deadzone N (dead-zone size), --square (square shape), --pressure, --burst N, --adc-fast, --poll. See HELP.
+Options: --deadzone N (dead-zone size), --square (square shape), --pressure, --burst N, --adc-fast, --settle N, --poll. See HELP.
 Tested on a G640 Variant 2: works. Back up first anyway. Every edit verifies the original bytes
 and refuses to run on any other image.
 """
@@ -54,21 +54,22 @@ OPTIONS
 
   --burst N
       Add-on, EXPERIMENTAL and untested. How long the tablet drives the
-      pen on each scan step, in cycles (stock is 28). Lower may scan
-      faster but gives a weaker signal. Try 20 and compare the rate in
+      pen on each scan step, in carrier cycles. Stock is 35: the boot
+      image says 28, but the startup code overwrites it with 35 before
+      the pen is ever scanned. Lower scans faster but gives a weaker signal. Try 20 and compare the rate in
       xppen-tools monitor. Changes 2 bytes.
         python3 make_patch.py ic901-code.bin --square --burst 20
       -> g640v2-nosmooth-square-burst-20.hex
 
   --adc-fast
-      Add-on, EXPERIMENTAL and untested. Runs the ADC conversion clock
-      twice as fast. The scan does about 50 ADC readings per step, so this
-      can raise the rate WITHOUT weakening the signal like a low --burst.
-      It only works if the chip clock is slow enough (about 30 MHz). If
-      the pen gets noisy or loses signal, the clock is too fast for this
-      and you should not use it. Changes 1 byte.
-        python3 make_patch.py ic901-code.bin --square --burst 20 --adc-fast
-      -> g640v2-nosmooth-square-burst-20-adc.hex
+      Add-on. Runs the ADC conversion clock twice as fast. The scan takes
+      about 50 ADC readings per step, so this raises the rate WITHOUT
+      weakening the signal like a low --burst. Changes 1 byte.
+      NOTE: the chip runs at about 60 MHz, so this puts the ADC clock at
+      about 33 ns, which is under the ~65 ns the ADC is rated for. It has
+      worked on a real G640 V2, but if the pen gets noisy, drop it.
+        python3 make_patch.py ic901-code.bin --square --burst 15 --adc-fast
+      -> g640v2-nosmooth-square-burst-15-adc.hex
 
   --poll
       Add-on. Sets the USB polling interval to 1 ms (stock 3 ms for the
@@ -77,6 +78,18 @@ OPTIONS
       speed up the scan. Changes 3 bytes.
         python3 make_patch.py ic901-code.bin --square --burst 15 --adc-fast --poll
       -> g640v2-nosmooth-square-burst-15-adc-poll.hex
+
+  --settle N
+      Add-on, EXPERIMENTAL. The wait between the end of the pen drive burst
+      and the first ADC reading, in microseconds (stock is 15). Allowed
+      range is 12 to 15. Every scan step pays this wait, 14 steps per
+      report, so each microsecond saved is only about 0.5% more rate
+      (15 -> 12 is roughly +4 Hz). A value of 8 was tried on a real G640 V2
+      and the tablet stopped detecting the pen at all (the antenna is
+      probably still ringing when the reading starts), which is why values
+      below 12 are refused. Changes 2 bytes.
+        python3 make_patch.py ic901-code.bin --square --burst 15 --adc-fast --poll --settle 12
+      -> g640v2-nosmooth-square-burst-15-adc-settle-12-poll.hex
 
   -h, --help
       Show this message.
@@ -96,17 +109,25 @@ EDITS = [
 PRESSURE = [(0x1D018660, "42000000", "64000000", "pressure light-touch factor 66 -> 100 (init image)"),
             (0x1D019D84, "42000424", "64000424", "pressure light-touch factor 66 -> 100 (reset code)")]
 
-# --burst N (experimental): number of carrier cycles the antenna is driven per scan step (stock 28 in the boot
-# image, 35 in the reset code). Fewer cycles = shorter steps, possibly a faster scan, but a weaker signal.
+# --burst N (experimental): number of carrier cycles the antenna is driven per scan step (28 in the boot image, but the
+# startup routine overwrites it with 35, so 35 is the live stock value). Fewer cycles = shorter steps, possibly a faster scan, but a weaker signal.
 def burst_edits(n):
     return [(0x1D018654, "1c", f"{n:02x}", "burst cycles 28 -> N (init image)"),
             (0x1D019D60, "23000324", f"{n:02x}000324", "burst cycles 35 -> N (reset code)")]
 
-# --adc-fast (experimental): AD1CON3 is written once, at 0x1D00CDD4, as 0x0701 (SAMC=7, ADCS=1). ADCS=1 makes the
-# ADC clock TAD = 4 peripheral-clock periods, so each of the ~50 conversions per scan step takes 12*TAD. ADCS=0
-# halves TAD (2 periods) and so halves the conversion time. The signal scale and the sample count do not change,
-# so no threshold needs rescaling. It only works if TAD stays above the ADC's minimum (about 65 ns).
+# --adc-fast: AD1CON3 is written once, at 0x1D00CDD4, as 0x0701 (SAMC=7, ADCS=1). ADCS=1 makes TAD = 4 peripheral-clock
+# periods; each of the ~50 conversions per scan step takes 12*TAD. ADCS=0 halves TAD. The chip runs at 60 MHz (DEVCFG:
+# 12 MHz /3 x15, FPBDIV /1; the 100 us timer reload of 6000 agrees), so TAD goes from 66.7 ns (at the ~65 ns minimum) to
+# 33 ns, which is out of spec but has worked on hardware. The SAMC field is NOT used: AD1CON1 = 0xA000 has SSRC = 0
+# (manual conversion), and the scan sets/clears SAMP itself with a 2-tick software wait, so SAMC was never doing anything.
 ADC_FAST = [(0x1D00CDD4, "01070924", "00070924", "AD1CON3 ADCS 1 -> 0: conversion clock twice as fast")]
+
+# --settle N: post-burst wait. The routine at 0x1D01B1A8 waits (a052a + a0060) * 60 timer ticks (60 ticks = 1 us) before
+# the first reading. a052a is the adaptive ring-down count (0 when the signal is weak) and a0060 is the fixed part.
+# Boot image has a0060 = 10 (0x1D01866C) but the startup routine at 0x1D019D04 overwrites it with 15 (0x1D019D98).
+def settle_edits(n):
+    return [(0x1D01866C, "0a", f"{n:02x}", "post-burst wait 10 -> N us (init image, overwritten at boot)"),
+            (0x1D019D98, "0f000624", f"{n:02x}000624", "post-burst wait 15 -> N us (startup defaults: the live value)")]
 
 # --poll: USB endpoint polling intervals (full speed, bInterval in ms). Stock EP81 = 4, EP82 (pen) = 3, EP83 = 3.
 # 1 ms removes the 333 Hz ceiling on how often the host reads the pen. It does not make the scan faster.
@@ -130,10 +151,11 @@ SQUARE_HOLD_NEW = (  # lw x4, |dY| -> a3, |dX| -> a1, a1 = max(a3,a1) < a0
     "2640e8002338070123306a00c32f06002630a6002328c500"
     "2a30e5000b38a6002a28e400")
 
-def build(data, deadzone=None, square=False, pressure=False, burst=None, adc_fast=False, poll=False):
+def build(data, deadzone=None, square=False, pressure=False, burst=None, adc_fast=False, poll=False, settle=None):
     edits = list(EDITS)
     if poll: edits += POLL
     if adc_fast: edits += ADC_FAST
+    if settle is not None: edits += settle_edits(settle)
     if burst is not None: edits += burst_edits(burst)
     if pressure: edits += PRESSURE
     if deadzone is not None:
@@ -164,7 +186,7 @@ def to_ihex(code, base=BASE):
     return "".join(out) + ":00000001FF\n"
 
 if __name__ == "__main__":
-    argv, deadzone, square, pressure, burst, adc_fast, poll, args, i = sys.argv[1:], None, False, False, None, False, False, [], 0
+    argv, deadzone, square, pressure, burst, adc_fast, poll, settle, args, i = sys.argv[1:], None, False, False, None, False, False, None, [], 0
     while i < len(argv):
         if argv[i] == "--square":
             square = True
@@ -172,11 +194,17 @@ if __name__ == "__main__":
             pressure = True
         elif argv[i] == "--adc-fast":
             adc_fast = True
+        elif argv[i] == "--sampc":
+            sys.exit("--sampc was removed: the ADC sample time field is not used by this firmware (manual conversion), so it did nothing")
+        elif argv[i] == "--settle":
+            if i + 1 >= len(argv) or not argv[i + 1].isdigit() or not 12 <= int(argv[i + 1]) <= 15:
+                sys.exit("--settle needs a whole number from 12 to 15 (microseconds, stock is 15). 8 stopped pen detection on a real G640 V2, so lower values are refused")
+            settle = int(argv[i + 1]); i += 1
         elif argv[i] == "--poll":
             poll = True
         elif argv[i] == "--burst":
             if i + 1 >= len(argv) or not argv[i + 1].isdigit() or not 1 <= int(argv[i + 1]) <= 255:
-                sys.exit("--burst needs a whole number from 1 to 255 (stock is 28)")
+                sys.exit("--burst needs a whole number from 1 to 255 (stock is 35)")
             burst = int(argv[i + 1]); i += 1
         elif argv[i] == "--deadzone":
             if i + 1 >= len(argv) or not argv[i + 1].isdigit() or not 0 <= int(argv[i + 1]) <= 255:
@@ -192,11 +220,11 @@ if __name__ == "__main__":
         sys.exit(0 if not argv or args[:1] in (["-h"], ["--help"], ["help"]) else 1)
     d = open(args[0], "rb").read()
     assert len(d) == SIZE, "wrong size - this is not the G640 Variant 2 IC901 application image"
-    b = build(d, deadzone, square, pressure, burst, adc_fast, poll)
+    b = build(d, deadzone, square, pressure, burst, adc_fast, poll, settle)
     if deadzone is None: name = "g640v2-nosmooth"
     elif square and deadzone == DEFAULT_DEADZONE: name = "g640v2-nosmooth-square"
     elif square: name = f"g640v2-nosmooth-square-{deadzone}"
     else: name = f"g640v2-nosmooth-deadzone-{deadzone}"
-    name += ("-pressure" if pressure else "") + (f"-burst-{burst}" if burst is not None else "") + ("-adc" if adc_fast else "") + ("-poll" if poll else "")
+    name += ("-pressure" if pressure else "") + (f"-burst-{burst}" if burst is not None else "") + ("-adc" if adc_fast else "") + (f"-settle-{settle}" if settle is not None else "") + ("-poll" if poll else "")
     open(f"{name}.hex", "w").write(to_ihex(b))
     print(f"wrote {name}.hex  sha256 {hashlib.sha256(b).hexdigest()[:16]}  {sum(x != y for x, y in zip(d, b))} bytes changed")
