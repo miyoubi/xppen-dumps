@@ -17,8 +17,11 @@ Removes the position smoothing from the XP-Pen G640 **Variant 2** firmware (IC 9
 
 ```sh
 python3 make_patch.py ic901-code.bin            # g640v2-nosmooth.hex
-python3 make_patch.py ic901-code.bin --square   # g640v2-nosmooth-square.hex
+python3 make_patch.py ic901-code.bin --square   # g640v2-nosmooth-square.hex (dead-zone 8)
+python3 make_patch.py ic901-code.bin --deadzone 12   # g640v2-nosmooth-square-12.hex
 ```
+
+`--deadzone N` sets the dead-zone size for a slow pen, in counts (0 to 255, 100 counts is about 1 mm). `--square` is short for `--deadzone 8`. The size shrinks to 0 as the pen speeds up. Larger is steadier at rest but stickier on tiny strokes.
 
 Writes the `.hex` to the current directory. The stock `ic901-code.bin` is in the dumps repo under `stock/G640 (Variant 2)/`.
 
@@ -59,7 +62,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 | Edit | Address | Stock | Patched | Effect |
 | --- | --- | --- | --- | --- |
 | Window | `0x1D0099D4` | `e884868f` | `01000624` | Averaging window forced to 1 sample (stock: 5 to 40, chosen by pen speed). This is the main smoothing. |
-| Hold | `0x1D018770` (16 B) | `80,70,50,50,50,45,45,45,45,45,45,35,30,25,20,15` | all `0`<br>`--square`: `8,7,6,5,4,3,2,1,0,0,0,0,0,0,0,0` | Dead-zone table. |
+| Hold | `0x1D018770` (16 B) | `80,70,50,50,50,45,45,45,45,45,45,35,30,25,20,15` | all `0`<br>`--square`: `8,7,6,5,4,3,2,1,0,0,0,0,0,0,0,0` (`--deadzone N` scales it) | Dead-zone table. |
 | Move flag | `0x1D009740` | `3200432c` | `0000432c` | "Pen moving" threshold 50 to 0. |
 | No-edge | `0x1D007FB8`, `7FE4`, `8024`, `8050` | `dd8482a3` | `00000000` | One raw sample outside the active area no longer sets pen state 3, which produced single `X=0 Y=0` reports. |
 | Square hold (`--square` only) | `0x1D0076F8` (60 B) | `\|dX\| + \|dY\| < threshold` | `max(\|dX\|, \|dY\|) < threshold` | Stock dead-zone is a diamond. This makes it a square: a move is ignored only if both axes moved less than the threshold. |
@@ -75,4 +78,3 @@ Position path: antenna geometry (`0x9ADC`) → fine X/Y (`0xA0000DA0/DA4`) → w
 | 2 | EP83 IN / EP03 OUT, 12 B | ID 2 | Vendor config. Not pen data. |
 
 The 3 ms bInterval on EP82 is a polling ceiling (about 333 Hz), not a report rate. The real rate is set by the tablet's pen scan. Forcing 1 ms (bInterval bytes at `0x1D018D45`, `0x1D018D5E`, `0x1D018D77`: `04/03/03` to `01`) is not included in the script. Run `xppen-tools monitor` to see the measured rate.
-
