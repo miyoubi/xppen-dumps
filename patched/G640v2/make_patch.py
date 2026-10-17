@@ -2,7 +2,7 @@
 """No-smoothing firmware builder for XP-Pen G640 (Variant 2), IC 901 (PIC32 / MIPS32 LE).
 
 Run with no arguments, or with -h / --help, to print the instructions.
-Options: --deadzone N (dead-zone size), --square (square shape), --pressure, --burst N, --adc-fast, --settle N, --poll. See HELP.
+Options: --deadzone N (dead-zone size), --square (square shape), --pressure, --burst N, --adc-fast, --settle N, --flash-fast, --poll. See HELP.
 Tested on a G640 Variant 2: works. Back up first anyway. Every edit verifies the original bytes
 and refuses to run on any other image.
 """
@@ -91,6 +91,22 @@ OPTIONS
         python3 make_patch.py ic901-code.bin --square --burst 15 --adc-fast --poll --settle 12
       -> g640v2-nosmooth-square-burst-15-adc-settle-12-poll.hex
 
+  --flash-fast
+      Add-on, EXPERIMENTAL and untested. The stock firmware never sets the
+      chip's flash wait states or prefetch (CHECON register), so after reset
+      every instruction is fetched from flash at 7 wait states with no
+      prefetch. This sets 3 wait states and turns prefetch on, so all code
+      (scan loop, math, interrupts) runs faster. It replaces 4 instructions
+      at the start of the startup code (an empty function call) with one
+      register write, 16 bytes. The scan timers do not change, but the ADC
+      read loop gets much faster, so pen signal levels may change a little.
+      RISK: this is the first option that touches hardware setup at boot. If
+      it were to hang, the tablet might not start, and I do not know a way
+      back into the bootloader from that state. Flash it only after a backup
+      and be ready to accept that risk.
+        python3 make_patch.py ic901-code.bin --square --burst 15 --adc-fast --poll --flash-fast
+      -> g640v2-nosmooth-square-burst-15-adc-flash-poll.hex
+
   -h, --help
       Show this message.
 """
@@ -129,6 +145,15 @@ def settle_edits(n):
     return [(0x1D01866C, "0a", f"{n:02x}", "post-burst wait 10 -> N us (init image, overwritten at boot)"),
             (0x1D019D98, "0f000624", f"{n:02x}000624", "post-burst wait 15 -> N us (startup defaults: the live value)")]
 
+# --flash-fast: the loader enters the app at 0x1D007000 and falls into the startup code at 0x1D007030. At 0x1D007038 the
+# startup calls an EMPTY function (0x1D01C97C: jr ra; nop), the slot where the usual compiler startup configures flash.
+# Nothing in the boot flash, loader or app writes CHECON (0xBF884000), so the chip stays at its reset state: prefetch off,
+# KSEG0 uncached, 7 flash wait states. Replace the 4-word call with: lui t0,0xbf88 / addiu t1,zero,0x33 / sw t1,0x4000(t0) / nop.
+# CHECON 0x33 = PFMWS 3 wait states (bits 2:0; 60 MHz needs 2, one extra for margin) + PREFEN 3 (bits 5:4, prefetch for cacheable
+# and non-cacheable). No cache (DCSZ 0) and CP0 Config.K0 is untouched, so no flash-write coherency issues.
+FLASH_FAST = [(0x1D007038, "029d083c7cc9082509f8000100000000", "88bf083c33000924004009ad00000000",
+               "startup: empty call -> CHECON = 0x33 (3 flash wait states, prefetch on)")]
+
 # --poll: USB endpoint polling intervals (full speed, bInterval in ms). Stock EP81 = 4, EP82 (pen) = 3, EP83 = 3.
 # 1 ms removes the 333 Hz ceiling on how often the host reads the pen. It does not make the scan faster.
 POLL = [(0x1D018D45, "04", "01", "EP81 IN bInterval 4 -> 1 ms"),
@@ -151,10 +176,11 @@ SQUARE_HOLD_NEW = (  # lw x4, |dY| -> a3, |dX| -> a1, a1 = max(a3,a1) < a0
     "2640e8002338070123306a00c32f06002630a6002328c500"
     "2a30e5000b38a6002a28e400")
 
-def build(data, deadzone=None, square=False, pressure=False, burst=None, adc_fast=False, poll=False, settle=None):
+def build(data, deadzone=None, square=False, pressure=False, burst=None, adc_fast=False, poll=False, settle=None, flash_fast=False):
     edits = list(EDITS)
     if poll: edits += POLL
     if adc_fast: edits += ADC_FAST
+    if flash_fast: edits += FLASH_FAST
     if settle is not None: edits += settle_edits(settle)
     if burst is not None: edits += burst_edits(burst)
     if pressure: edits += PRESSURE
@@ -186,7 +212,7 @@ def to_ihex(code, base=BASE):
     return "".join(out) + ":00000001FF\n"
 
 if __name__ == "__main__":
-    argv, deadzone, square, pressure, burst, adc_fast, poll, settle, args, i = sys.argv[1:], None, False, False, None, False, False, None, [], 0
+    argv, deadzone, square, pressure, burst, adc_fast, poll, settle, flash_fast, args, i = sys.argv[1:], None, False, False, None, False, False, None, False, [], 0
     while i < len(argv):
         if argv[i] == "--square":
             square = True
@@ -194,6 +220,8 @@ if __name__ == "__main__":
             pressure = True
         elif argv[i] == "--adc-fast":
             adc_fast = True
+        elif argv[i] == "--flash-fast":
+            flash_fast = True
         elif argv[i] == "--sampc":
             sys.exit("--sampc was removed: the ADC sample time field is not used by this firmware (manual conversion), so it did nothing")
         elif argv[i] == "--settle":
@@ -220,11 +248,11 @@ if __name__ == "__main__":
         sys.exit(0 if not argv or args[:1] in (["-h"], ["--help"], ["help"]) else 1)
     d = open(args[0], "rb").read()
     assert len(d) == SIZE, "wrong size - this is not the G640 Variant 2 IC901 application image"
-    b = build(d, deadzone, square, pressure, burst, adc_fast, poll, settle)
+    b = build(d, deadzone, square, pressure, burst, adc_fast, poll, settle, flash_fast)
     if deadzone is None: name = "g640v2-nosmooth"
     elif square and deadzone == DEFAULT_DEADZONE: name = "g640v2-nosmooth-square"
     elif square: name = f"g640v2-nosmooth-square-{deadzone}"
     else: name = f"g640v2-nosmooth-deadzone-{deadzone}"
-    name += ("-pressure" if pressure else "") + (f"-burst-{burst}" if burst is not None else "") + ("-adc" if adc_fast else "") + (f"-settle-{settle}" if settle is not None else "") + ("-poll" if poll else "")
+    name += ("-pressure" if pressure else "") + (f"-burst-{burst}" if burst is not None else "") + ("-adc" if adc_fast else "") + (f"-settle-{settle}" if settle is not None else "") + ("-flash" if flash_fast else "") + ("-poll" if poll else "")
     open(f"{name}.hex", "w").write(to_ihex(b))
     print(f"wrote {name}.hex  sha256 {hashlib.sha256(b).hexdigest()[:16]}  {sum(x != y for x, y in zip(d, b))} bytes changed")
