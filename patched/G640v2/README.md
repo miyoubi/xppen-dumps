@@ -28,12 +28,13 @@ python3 make_patch.py ic901-code.bin --square --deadzone 12   # g640v2-nosmooth-
 | `--deadzone N` | Adds a dead-zone of size N with the stock **diamond** shape (X move + Y move added together). |
 | `--square` | **Square** shape: X and Y are checked separately, so a move is ignored only if both moved less than the size. Default size is 8. |
 | `--square --deadzone N` | Square shape with your own size. |
+| `--pressure` | Add-on, **experimental, untested**. Light-touch pressure factor 66% to 100% (2 bytes). |
 
-**Shapes:** the dead-zone is the area around the last reported position that the pen must leave before the cursor moves. *Square* is a box: moving N in X or N in Y is enough. *Diamond* (stock) adds X and Y together, so it reaches the full size along the axes but is smaller on the diagonals. Other users report the stock dead-zone on G640 tablets as square or possibly round, at roughly 10 to 16 units. That is unconfirmed, and the stock shape has not been measured on this tablet.
+`--pressure` combines with any build, e.g. `python3 make_patch.py ic901-code.bin --square --pressure`. It adds `-pressure` to the file name.
+
+**Shapes:** the dead-zone is the area around the last reported position that the pen must leave before the cursor moves. *Square* is a box: moving N in X or N in Y is enough. *Diamond* (stock) adds X and Y together, so it reaches the full size along the axes but is smaller on the diagonals.
 
 N is the dead-zone size for a slow pen, in counts (0 to 255, 100 counts is about 1 mm). It shrinks to 0 as the pen speeds up. Larger is steadier at rest but stickier on tiny strokes. The same N feels steadier with `--square`, because the diamond zone is smaller per axis.
-
-Only `--square` (size 8) has been tested on hardware. The diamond builds and other sizes have not.
 
 Writes the `.hex` to the current directory. The stock `ic901-code.bin` is in the dumps repo under `stock/G640 (Variant 2)/`.
 
@@ -77,6 +78,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 | Hold | `0x1D018770` (16 B) | `80,70,50,50,50,45,45,45,45,45,45,35,30,25,20,15` | all `0`<br>`--square`: `8,7,6,5,4,3,2,1,0,0,0,0,0,0,0,0`<br>`--deadzone N` scales it (size N) | Dead-zone table. |
 | Move flag | `0x1D009740` | `3200432c` | `0000432c` | "Pen moving" threshold 50 to 0. |
 | No-edge | `0x1D007FB8`, `7FE4`, `8024`, `8050` | `dd8482a3` | `00000000` | One raw sample outside the active area no longer sets pen state 3, which produced single `X=0 Y=0` reports. |
+| Pressure (`--pressure` only) | `0x1D018660`, `0x1D019D84` | `42` (66) | `64` (100) | In the light-touch zone the firmware reports 66% of the last pressure for a few frames. This sets it to 100%. Experimental. |
 | Square hold (`--square` only) | `0x1D0076F8` (60 B) | `\|dX\| + \|dY\| < threshold` | `max(\|dX\|, \|dY\|) < threshold` | Stock dead-zone is a diamond. This makes it a square: a move is ignored only if both axes moved less than the threshold. |
 
 Position path: antenna geometry (`0x9ADC`) → fine X/Y (`0xA0000DA0/DA4`) → window average (`0x99D4`) → scale → hold (`0x76F8`) → report bytes `0xA00004B7`..`BA`. A separate coarse position, smoothed by IIR filters, only selects which antenna group to scan and never reaches the report.
