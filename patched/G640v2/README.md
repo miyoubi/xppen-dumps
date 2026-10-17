@@ -16,12 +16,24 @@ Removes the position smoothing from the XP-Pen G640 **Variant 2** firmware (IC 9
 ## Build
 
 ```sh
-python3 make_patch.py ic901-code.bin            # g640v2-nosmooth.hex
-python3 make_patch.py ic901-code.bin --square   # g640v2-nosmooth-square.hex (dead-zone 8)
-python3 make_patch.py ic901-code.bin --deadzone 12   # g640v2-nosmooth-square-12.hex
+python3 make_patch.py ic901-code.bin                          # g640v2-nosmooth.hex
+python3 make_patch.py ic901-code.bin --deadzone 12            # g640v2-nosmooth-deadzone-12.hex
+python3 make_patch.py ic901-code.bin --square                 # g640v2-nosmooth-square.hex (size 8)
+python3 make_patch.py ic901-code.bin --square --deadzone 12   # g640v2-nosmooth-square-12.hex
 ```
 
-`--deadzone N` sets the dead-zone size for a slow pen, in counts (0 to 255, 100 counts is about 1 mm). `--square` is short for `--deadzone 8`. The size shrinks to 0 as the pen speeds up. Larger is steadier at rest but stickier on tiny strokes.
+| Option | Effect |
+| --- | --- |
+| *(none)* | Raw. No dead-zone, so the cursor may shake a little when the pen is held still. |
+| `--deadzone N` | Adds a dead-zone of size N with the stock **diamond** shape (X move + Y move added together). |
+| `--square` | **Square** shape: X and Y are checked separately, so a move is ignored only if both moved less than the size. Default size is 8. |
+| `--square --deadzone N` | Square shape with your own size. |
+
+**Shapes:** the dead-zone is the area around the last reported position that the pen must leave before the cursor moves. *Square* is a box: moving N in X or N in Y is enough. *Diamond* (stock) adds X and Y together, so it reaches the full size along the axes but is smaller on the diagonals. Other users report the stock dead-zone on G640 tablets as square or possibly round, at roughly 10 to 16 units. That is unconfirmed, and the stock shape has not been measured on this tablet.
+
+N is the dead-zone size for a slow pen, in counts (0 to 255, 100 counts is about 1 mm). It shrinks to 0 as the pen speeds up. Larger is steadier at rest but stickier on tiny strokes. The same N feels steadier with `--square`, because the diamond zone is smaller per axis.
+
+Only `--square` (size 8) has been tested on hardware. The diamond builds and other sizes have not.
 
 Writes the `.hex` to the current directory. The stock `ic901-code.bin` is in the dumps repo under `stock/G640 (Variant 2)/`.
 
@@ -32,7 +44,7 @@ Uses [`xppen-tools`](https://github.com/NiceAesth) by NiceAesth.
 1. `sudo ./xppen-tools info`: if the bootloader PID is **FFF3**, stop. It has no exit-DFU command and the tablet can get stuck.
 2. `sudo ./xppen-tools dump backup`: makes a verified backup.
 3. `sudo ./xppen-tools dfu`: reboots into DFU mode.
-4. `sudo ./xppen-tools update g640v2-nosmooth.hex` (or the `-square` file): do not unplug while it writes.
+4. `sudo ./xppen-tools update g640v2-nosmooth.hex` (or whichever `.hex` you built): do not unplug while it writes.
 
 `sudo ./xppen-tools exit-dfu` leaves DFU mode without flashing.
 
@@ -57,12 +69,12 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ## What changes
 
-37 bytes in total (82 with `--square`). Stock pipeline: raw position, moving average, area check, dead-zone, report.
+37 bytes in total (82 with `--square`; `--deadzone N` alone is still 37). Stock pipeline: raw position, moving average, area check, dead-zone, report.
 
 | Edit | Address | Stock | Patched | Effect |
 | --- | --- | --- | --- | --- |
 | Window | `0x1D0099D4` | `e884868f` | `01000624` | Averaging window forced to 1 sample (stock: 5 to 40, chosen by pen speed). This is the main smoothing. |
-| Hold | `0x1D018770` (16 B) | `80,70,50,50,50,45,45,45,45,45,45,35,30,25,20,15` | all `0`<br>`--square`: `8,7,6,5,4,3,2,1,0,0,0,0,0,0,0,0` (`--deadzone N` scales it) | Dead-zone table. |
+| Hold | `0x1D018770` (16 B) | `80,70,50,50,50,45,45,45,45,45,45,35,30,25,20,15` | all `0`<br>`--square`: `8,7,6,5,4,3,2,1,0,0,0,0,0,0,0,0`<br>`--deadzone N` scales it (size N) | Dead-zone table. |
 | Move flag | `0x1D009740` | `3200432c` | `0000432c` | "Pen moving" threshold 50 to 0. |
 | No-edge | `0x1D007FB8`, `7FE4`, `8024`, `8050` | `dd8482a3` | `00000000` | One raw sample outside the active area no longer sets pen state 3, which produced single `X=0 Y=0` reports. |
 | Square hold (`--square` only) | `0x1D0076F8` (60 B) | `\|dX\| + \|dY\| < threshold` | `max(\|dX\|, \|dY\|) < threshold` | Stock dead-zone is a diamond. This makes it a square: a move is ignored only if both axes moved less than the threshold. |
