@@ -12,56 +12,37 @@ BASE, SIZE = 0x1D006000, 102400
 
 HELP = """\
 XP-Pen G640 (Variant 2) no-smoothing firmware builder
-For the G640 Variant 2 ONLY (USB ID 28BD:0914). Tested and working on hardware. Use at your own risk.
+Only for the G640 Variant 2 (USB ID 28BD:0914). Use at your own risk.
 
-HOW TO USE IT, STEP BY STEP
+USAGE
+  python3 make_patch.py ic901-code.bin [option]
 
- 1. Get the files
-      - xppen-dumps-main.zip (stock firmware dumps) and the xppen-tools build for your OS.
-      - unzip xppen-dumps-main.zip
+  ic901-code.bin is the stock firmware, in the dumps repo under
+  stock/G640 (Variant 2)/. The script writes a .hex file you can flash
+  with xppen-tools.
 
- 2. Copy the stock firmware next to this script
-      cp "xppen-dumps-main/stock/G640 (Variant 2)/ic901-code.bin" .
-
- 3. Build the patched firmware
-      python3 make_patch.py ic901-code.bin            fully raw, no dead-zone (cursor shakes at rest)
-      python3 make_patch.py ic901-code.bin --square   same, plus a small SQUARE dead-zone while the pen is still
-      python3 make_patch.py ic901-code.bin --deadzone 12   same, with the dead-zone size you choose (counts)
-    This writes g640v2-nosmooth.hex, g640v2-nosmooth-square.hex or g640v2-nosmooth-square-12.hex
-    in the current directory.
-    It refuses to run on any file that is not the stock Variant 2 image.
-
- 4. Check the tablet is connected and what it is
-      sudo ./xppen-tools info
-    It should show 28BD:0914 and an IC 901 firmware (UG901_...).
-    If the bootloader PID is FFF3, STOP: that bootloader has no exit-DFU command.
-
- 5. Back up the current firmware (do not skip)
-      sudo ./xppen-tools dump backup
-
- 6. Put the tablet in DFU mode
-      sudo ./xppen-tools dfu
-
- 7. Flash. Do NOT unplug the tablet while it writes.
-      sudo ./xppen-tools update g640v2-nosmooth.hex      (or g640v2-nosmooth-square.hex)
-
- 8. Check the result
-      sudo ./xppen-tools monitor
-    Draw on the tablet and watch the pen state and report rate.
-    
 OPTIONS
-  (none)     Fully raw. Every position the tablet measures goes straight to the cursor.
-             Nothing is averaged and nothing is held back, so the cursor wobbles a few counts
-             at rest (100 counts = about 1 mm). 37 bytes changed.
 
-  --square   Same as above, plus a small dead-zone while the pen is nearly still. 82 bytes changed.
+  (none)
+      Raw. The cursor goes exactly where the pen is, with no smoothing.
+      It may shake a little when the pen is held still.
+        python3 make_patch.py ic901-code.bin
+      -> g640v2-nosmooth.hex
 
-  --deadzone N   Same as --square, but you choose the size N, a whole number from 0 to 255 counts.
-             Examples:  --deadzone 4   smaller, less sticky on tiny strokes, more shake
-                        --deadzone 8   the --square default (about 0.08 mm)
-                        --deadzone 16  larger, steadier at rest, more sticky
-             Non-default sizes are written to g640v2-nosmooth-square-N.hex, so builds don't overwrite
-             each other.
+  --square
+      Raw, but tiny movements are ignored while the pen is nearly still.
+      This stops the shaking. Real movement still passes through right away.
+        python3 make_patch.py ic901-code.bin --square
+      -> g640v2-nosmooth-square.hex
+
+  --deadzone N
+      Same as --square, but you pick the size N (0 to 255).
+      100 = about 1 mm. Higher is steadier but stickier; lower is the reverse.
+        python3 make_patch.py ic901-code.bin --deadzone 12
+      -> g640v2-nosmooth-square-12.hex
+
+  -h, --help
+      Show this message.
 """
 
 # (address, expected original bytes, new bytes, description)
