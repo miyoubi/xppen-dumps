@@ -2,7 +2,7 @@
 """No-smoothing firmware builder for XP-Pen G640 (Variant 2), IC 901 (PIC32 / MIPS32 LE).
 
 Run with no arguments, or with -h / --help, to print the instructions.
-Options: --deadzone N (dead-zone size), --square (square shape), --pressure. See HELP.
+Options: --deadzone N (dead-zone size), --square (square shape), --pressure, --burst N. See HELP.
 Tested on a G640 Variant 2: works. Back up first anyway. Every edit verifies the original bytes
 and refuses to run on any other image.
 """
@@ -52,6 +52,14 @@ OPTIONS
         python3 make_patch.py ic901-code.bin --square --pressure
       -> g640v2-nosmooth-square-pressure.hex
 
+  --burst N
+      Add-on, EXPERIMENTAL and untested. How long the tablet drives the
+      pen on each scan step, in cycles (stock is 28). Lower may scan
+      faster but gives a weaker signal. Try 20 and compare the rate in
+      xppen-tools monitor. Changes 2 bytes.
+        python3 make_patch.py ic901-code.bin --square --burst 20
+      -> g640v2-nosmooth-square-burst-20.hex
+
   -h, --help
       Show this message.
 """
@@ -70,6 +78,12 @@ EDITS = [
 PRESSURE = [(0x1D018660, "42000000", "64000000", "pressure light-touch factor 66 -> 100 (init image)"),
             (0x1D019D84, "42000424", "64000424", "pressure light-touch factor 66 -> 100 (reset code)")]
 
+# --burst N (experimental): number of carrier cycles the antenna is driven per scan step (stock 28 in the boot
+# image, 35 in the reset code). Fewer cycles = shorter steps, possibly a faster scan, but a weaker signal.
+def burst_edits(n):
+    return [(0x1D018654, "1c", f"{n:02x}", "burst cycles 28 -> N (init image)"),
+            (0x1D019D60, "23000324", f"{n:02x}000324", "burst cycles 35 -> N (reset code)")]
+
 # --square: small dead-zone table + hold check rewritten from |dX|+|dY| (diamond) to max(|dX|,|dY|) (square).
 DEFAULT_DEADZONE = 8   # counts (100 counts = about 1 mm)
 
@@ -86,8 +100,9 @@ SQUARE_HOLD_NEW = (  # lw x4, |dY| -> a3, |dX| -> a1, a1 = max(a3,a1) < a0
     "2640e8002338070123306a00c32f06002630a6002328c500"
     "2a30e5000b38a6002a28e400")
 
-def build(data, deadzone=None, square=False, pressure=False):
+def build(data, deadzone=None, square=False, pressure=False, burst=None):
     edits = list(EDITS)
+    if burst is not None: edits += burst_edits(burst)
     if pressure: edits += PRESSURE
     if deadzone is not None:
         edits[1] = (edits[1][0], edits[1][1], square_table(deadzone).hex(), "dead-zone table")
@@ -117,12 +132,16 @@ def to_ihex(code, base=BASE):
     return "".join(out) + ":00000001FF\n"
 
 if __name__ == "__main__":
-    argv, deadzone, square, pressure, args, i = sys.argv[1:], None, False, False, [], 0
+    argv, deadzone, square, pressure, burst, args, i = sys.argv[1:], None, False, False, None, [], 0
     while i < len(argv):
         if argv[i] == "--square":
             square = True
         elif argv[i] == "--pressure":
             pressure = True
+        elif argv[i] == "--burst":
+            if i + 1 >= len(argv) or not argv[i + 1].isdigit() or not 1 <= int(argv[i + 1]) <= 255:
+                sys.exit("--burst needs a whole number from 1 to 255 (stock is 28)")
+            burst = int(argv[i + 1]); i += 1
         elif argv[i] == "--deadzone":
             if i + 1 >= len(argv) or not argv[i + 1].isdigit() or not 0 <= int(argv[i + 1]) <= 255:
                 sys.exit("--deadzone needs a whole number from 0 to 255 (counts)")
@@ -137,11 +156,11 @@ if __name__ == "__main__":
         sys.exit(0 if not argv or args[:1] in (["-h"], ["--help"], ["help"]) else 1)
     d = open(args[0], "rb").read()
     assert len(d) == SIZE, "wrong size - this is not the G640 Variant 2 IC901 application image"
-    b = build(d, deadzone, square, pressure)
+    b = build(d, deadzone, square, pressure, burst)
     if deadzone is None: name = "g640v2-nosmooth"
     elif square and deadzone == DEFAULT_DEADZONE: name = "g640v2-nosmooth-square"
     elif square: name = f"g640v2-nosmooth-square-{deadzone}"
     else: name = f"g640v2-nosmooth-deadzone-{deadzone}"
-    name += "-pressure" if pressure else ""
+    name += ("-pressure" if pressure else "") + (f"-burst-{burst}" if burst is not None else "")
     open(f"{name}.hex", "w").write(to_ihex(b))
     print(f"wrote {name}.hex  sha256 {hashlib.sha256(b).hexdigest()[:16]}  {sum(x != y for x, y in zip(d, b))} bytes changed")
