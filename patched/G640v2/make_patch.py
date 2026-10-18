@@ -2,7 +2,7 @@
 """No-smoothing firmware builder for XP-Pen G640 (Variant 2), IC 901 (PIC32 / MIPS32 LE).
 
 Run with no arguments, or with -h / --help, to print the instructions.
-Options: --deadzone N (dead-zone size), --square (square shape), --pressure, --burst N, --adc-fast, --settle N, --flash-fast, --smooth N, --hover-hold N, --poll. See HELP.
+Options: --deadzone N (dead-zone size), --square (square shape), --pressure, --burst N, --adc-fast, --settle N, --flash-fast, --smooth N, --hover-hold N, --adaptive N, --poll. See HELP.
 Tested on a G640 Variant 2: works. Back up first anyway. Every edit verifies the original bytes
 and refuses to run on any other image.
 """
@@ -139,6 +139,33 @@ OPTIONS
         python3 make_patch.py ic901-code.bin --square --burst 15 --adc-fast --poll --hover-hold 40
       -> g640v2-nosmooth-square-burst-15-adc-hover-40-poll.hex
 
+  --adaptive N
+      Add-on, EXPERIMENTAL (checked in an emulator running the real firmware
+      code, not yet on a tablet). Steadier cursor with almost no lag: light
+      smoothing that switches itself off when the pen moves. N = 2 to 8 is
+      the averaging window used while the pen is nearly still (4 is a good
+      start). Instead of the base build's fixed window of 1, it keeps the
+      firmware's own moving average and rewrites its speed tables: the
+      stock ones start at a window of 13 (pen down) / 10 (hover) and only
+      reach 1 at a very high speed, which is the heavy lag of the stock
+      firmware. With --adaptive the window is N at rest, drops to 1 by about
+      2 to 3 mm of lag distance, and is 1 for fast strokes. The speed measure
+      is the distance between the new reading and the last output, so it
+      reacts at once to a real move (a 3 mm jump goes through with no lag).
+      Emulator numbers for N=4 (sensor noise sigma 7 raw, about 14 in the
+      report units that xppen-tools monitor shows): sideways jitter on a
+      line 0.39x at rest, 0.5x at 36 mm/s, 0.56x at 70 mm/s, 0.67x at
+      140 mm/s. Lag 0.1 to 0.3 mm at handwriting speed (stock: about 1 mm).
+      A circle of 3 mm radius at 95 mm/s keeps its size and its radius
+      ripple halves. N=3 is lighter, N=6 steadier (jitter 0.29x at rest,
+      about 10 ms of lag when crawling). Hover gets N+2 at rest. It works
+      with a dead-zone of 0, so no sticky hold is needed. Replaces the
+      averaging-window edit, so it cannot be combined with --smooth.
+      It changes only table data (26 init values) and turns 26 startup
+      stores into nops. No new code is added.
+        python3 make_patch.py ic901-code.bin --burst 15 --adc-fast --poll --adaptive 4
+      -> g640v2-nosmooth-burst-15-adc-adaptive-4-poll.hex
+
   -h, --help
       Show this message.
 """
@@ -222,9 +249,66 @@ HOVER_SITES = (0x1D007C20, 0x1D007CEC, 0x1D007DB8)
 def hover_edits(n):
     return [(a, "d4848493", f"{n:02x}000424", f"hover hold threshold = {n} counts") for a in HOVER_SITES]
 
+# --adaptive N: the stock averaging at 0x1D0099D4 is a moving average whose window N is picked at 0x1D009790..0x1D0099D0 from the
+# distance d = |dX|+|dY| between the new raw fine position and the previous averaged output (computed at 0x1D0096D8, raw units
+# 0..15999 for X, 100 per mm; the HID report is 0..32767, i.e. 2.05x). Pen down (pressure != 0): ten ascending thresholds T0..T9 at
+# RAM 0xA00000DE..F0 pick one of eleven windows (0xA00000FC, FE..110); hover: thresholds T0, T5, T6, T9 pick one of five windows
+# (F2 d<=T0, F4 d<=T5, F8 d<=T6, F6 d<=T9, FA above). The tables live in the RAM init image (flash 0x1D0186EA..) and the startup
+# routine at 0x1D019E70..0x1D019F24 stores the stock values over them (live stock: T = 100..4000, pen windows 13,12,11,10,9,7,7,6,
+# 5,4,3, hover 10,5,3,1,1), so both are edited: init values replaced, those 26 stores turned into nops.
+# The stock thresholds start at 100 (1 mm) while pen noise gives d of about 10 to 30, so the selector could never tell noise from motion.
+ADA_THR = [20, 30, 40, 60, 80, 120, 180, 280, 440, 700]
+ADA_LADDER = [1, .8, .62, .5, .38, .25, .12, 0, 0, 0, 0]
+ADA_THR_ADDR = [0xA00000DE + 2 * i for i in range(10)]
+ADA_PEN_ADDR = [0xA00000FC] + [0xA00000FE + 2 * i for i in range(10)]
+ADA_HOV_ADDR = [0xA00000F2, 0xA00000F4, 0xA00000F8, 0xA00000F6, 0xA00000FA]
+ADA_STOCK_INIT = {0xA00000DE: 100, 0xA00000E0: 150, 0xA00000E2: 200, 0xA00000E4: 250, 0xA00000E6: 300, 0xA00000E8: 400,
+                  0xA00000EA: 600, 0xA00000EC: 1000, 0xA00000EE: 1500, 0xA00000F0: 2000,
+                  0xA00000F2: 25, 0xA00000F4: 15, 0xA00000F6: 8, 0xA00000F8: 7, 0xA00000FA: 5, 0xA00000FC: 40,
+                  0xA00000FE: 30, 0xA0000100: 30, 0xA0000102: 20, 0xA0000104: 15, 0xA0000106: 15, 0xA0000108: 12,
+                  0xA000010A: 8, 0xA000010C: 5, 0xA000010E: 3, 0xA0000110: 1}
+
+def adaptive_tables(n):
+    pen = [max(1, round(1 + (n - 1) * f)) for f in ADA_LADDER]
+    nh = n + 2
+    return ADA_THR, pen, [nh, max(1, round(nh * .5)), 2, 1, 1]
+
+def init_image_locations(data):
+    """flash address of every RAM byte in the init image (records of dest, length, copy-flag, data at 0x1D0183CC)"""
+    import struct
+    p, where = 0x1D0183CC - BASE, {}
+    while True:
+        dest, ln, flag = struct.unpack("<III", data[p:p + 12])
+        if dest == 0: break
+        p += 12
+        if flag:
+            for i in range(ln): where[dest + i] = BASE + p + i
+            p += ln
+        p = (p + 3) & ~3
+    return where
+
+def adaptive_edits(data, n):
+    import struct
+    thr, pen, hov = adaptive_tables(n)
+    vals = dict(zip(ADA_THR_ADDR, thr)); vals.update(zip(ADA_PEN_ADDR, pen)); vals.update(zip(ADA_HOV_ADDR, hov))
+    where, edits = init_image_locations(data), []
+    for a, v in sorted(vals.items()):
+        f = where[a]
+        assert struct.unpack("<H", data[f - BASE:f - BASE + 2])[0] == ADA_STOCK_INIT[a], f"init image value differs at {a:#x}"
+        edits.append((f, data[f - BASE:f - BASE + 2].hex(), struct.pack("<H", v).hex(), f"init image {a:#x} = {v}"))
+    nops = 0
+    for pc in range(0x1D019E70, 0x1D019F2C, 4):          # sh rX,off(gp) to a table address -> nop
+        w = struct.unpack("<I", data[pc - BASE:pc - BASE + 4])[0]
+        if (w >> 26) == 41 and ((w >> 21) & 31) == 28:
+            a = (0xA0007FF0 + ((w & 0xFFFF) - (0x10000 if w & 0x8000 else 0))) & 0xFFFFFFFF
+            if a in vals:
+                edits.append((pc, data[pc - BASE:pc - BASE + 4].hex(), "00000000", f"startup store to {a:#x} removed")); nops += 1
+    assert nops == len(vals) == 26, (nops, len(vals))
+    return edits
+
 SAMPLE_WAIT = None
 
-def build(data, deadzone=None, square=False, pressure=False, burst=None, adc_fast=False, poll=False, settle=None, flash_fast=False, smooth=None, hover_hold=None):
+def build(data, deadzone=None, square=False, pressure=False, burst=None, adc_fast=False, poll=False, settle=None, flash_fast=False, smooth=None, hover_hold=None, adaptive=None):
     edits = list(EDITS)
     if hover_hold is not None: edits += hover_edits(hover_hold)
     if smooth is not None: edits[0] = smooth_edit(smooth)
@@ -239,6 +323,8 @@ def build(data, deadzone=None, square=False, pressure=False, burst=None, adc_fas
         edits[1] = (edits[1][0], edits[1][1], square_table(deadzone).hex(), "dead-zone table")
     if square:
         edits.append((0x1D0076F8, SQUARE_HOLD_OLD, SQUARE_HOLD_NEW, "hold check: |dX|+|dY| -> max(|dX|,|dY|)"))
+    if adaptive is not None:
+        edits = [e for e in edits if e[0] != 0x1D0099D4] + adaptive_edits(data, adaptive)   # keep the stock averaging, change its tables
     out, seen = bytearray(data), set()
     for addr, old, new, why in edits:
         o, n = addr - BASE, len(old) // 2
@@ -263,7 +349,7 @@ def to_ihex(code, base=BASE):
     return "".join(out) + ":00000001FF\n"
 
 if __name__ == "__main__":
-    argv, deadzone, square, pressure, burst, adc_fast, poll, settle, flash_fast, smooth, hover_hold, args, i = sys.argv[1:], None, False, False, None, False, False, None, False, None, None, [], 0
+    argv, deadzone, square, pressure, burst, adc_fast, poll, settle, flash_fast, smooth, hover_hold, adaptive, args, i = sys.argv[1:], None, False, False, None, False, False, None, False, None, None, None, [], 0
     while i < len(argv):
         if argv[i] == "--square":
             square = True
@@ -277,6 +363,10 @@ if __name__ == "__main__":
             if i + 1 >= len(argv) or not argv[i + 1].isdigit() or not 1 <= int(argv[i + 1]) <= 255:
                 sys.exit("--hover-hold needs a whole number from 1 to 255 (counts, 100 is about 1 mm)")
             hover_hold = int(argv[i + 1]); i += 1
+        elif argv[i] == "--adaptive":
+            if i + 1 >= len(argv) or not argv[i + 1].isdigit() or not 2 <= int(argv[i + 1]) <= 8:
+                sys.exit("--adaptive needs a whole number from 2 to 8 (averaging window at rest; 4 is a good start)")
+            adaptive = int(argv[i + 1]); i += 1
         elif argv[i] == "--smooth":
             if i + 1 >= len(argv) or not argv[i + 1].isdigit() or not 2 <= int(argv[i + 1]) <= 8:
                 sys.exit("--smooth needs a whole number from 2 to 8 (averaging window in samples; the default build uses 1)")
@@ -309,13 +399,15 @@ if __name__ == "__main__":
     if len(args) != 1 or args[0] in ("-h", "--help", "help"):
         print(HELP)
         sys.exit(0 if not argv or args[:1] in (["-h"], ["--help"], ["help"]) else 1)
+    if adaptive is not None and smooth is not None:
+        sys.exit("--adaptive and --smooth both set the averaging window: use one of them")
     d = open(args[0], "rb").read()
     assert len(d) == SIZE, "wrong size - this is not the G640 Variant 2 IC901 application image"
-    b = build(d, deadzone, square, pressure, burst, adc_fast, poll, settle, flash_fast, smooth, hover_hold)
+    b = build(d, deadzone, square, pressure, burst, adc_fast, poll, settle, flash_fast, smooth, hover_hold, adaptive)
     if deadzone is None: name = "g640v2-nosmooth"
     elif square and deadzone == DEFAULT_DEADZONE: name = "g640v2-nosmooth-square"
     elif square: name = f"g640v2-nosmooth-square-{deadzone}"
     else: name = f"g640v2-nosmooth-deadzone-{deadzone}"
-    name += ("-pressure" if pressure else "") + (f"-burst-{burst}" if burst is not None else "") + ("-adc" if adc_fast else "") + (f"-settle-{settle}" if settle is not None else "") + ("-flash" if flash_fast else "") + (f"-smooth-{smooth}" if smooth is not None else "") + (f"-hover-{hover_hold}" if hover_hold is not None else "") + (f"-sw-{SAMPLE_WAIT}" if SAMPLE_WAIT is not None else "") + ("-poll" if poll else "")
+    name += ("-pressure" if pressure else "") + (f"-burst-{burst}" if burst is not None else "") + ("-adc" if adc_fast else "") + (f"-settle-{settle}" if settle is not None else "") + ("-flash" if flash_fast else "") + (f"-smooth-{smooth}" if smooth is not None else "") + (f"-adaptive-{adaptive}" if adaptive is not None else "") + (f"-hover-{hover_hold}" if hover_hold is not None else "") + (f"-sw-{SAMPLE_WAIT}" if SAMPLE_WAIT is not None else "") + ("-poll" if poll else "")
     open(f"{name}.hex", "w").write(to_ihex(b))
     print(f"wrote {name}.hex  sha256 {hashlib.sha256(b).hexdigest()[:16]}  {sum(x != y for x, y in zip(d, b))} bytes changed")

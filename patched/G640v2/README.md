@@ -40,11 +40,18 @@ The script writes one `.hex` file, named after the options you chose. It does no
 | `--smooth N` | Optional, off by default. Light smoothing, N = 2 to 8, instead of the base build's window of 1 (stock was about 11 samples while touching). Not tested on a tablet. |
 | `--hover-hold N` | Experimental. Fixed hold of N counts (100 = about 1 mm) while the pen hovers, to stop the hover cursor twitching. No averaging, no lag, and pen-down behaviour is unchanged. Try 30 to 40. |
 | `--sample-wait N` | Experimental, did not help. ADC sample-and-hold wait in timer ticks (60 = 1 us, stock 2). N = 1 to 30. Tested 6 and 12 on the square-12 base; both were worse. Not recommended. |
+| `--adaptive N` | Experimental (emulator-checked, not yet on a tablet). Speed-adaptive light smoothing for a steadier cursor with almost no lag, N = 2 to 8 (start with 4). Works with a dead-zone of 0. See below. |
 | `--poll` | Sets USB polling to 1 ms (stock 3 ms for the pen). Removes the 333 Hz host-side ceiling. It does not speed up the scan. |
 | `--settle N` | Experimental. Wait between the end of the drive burst and the first ADC reading, in microseconds (stock 15). Only 12 to 15 is accepted, because 8 stopped pen detection on a real G640 V2. |
 | `--flash-fast` | Experimental, riskier than the others, and **not recommended**: flashed on a real G640 V2 with no noticeable difference. Sets flash wait states and prefetch at startup (see below). |
 
 Examples:
+
+```sh
+# Steadier cursor without a dead-zone (adaptive smoothing, window 4 at rest)
+python3 make_patch.py ic901-code.bin --burst 15 --adc-fast --poll --adaptive 4
+# -> g640v2-nosmooth-burst-15-adc-adaptive-4-poll.hex
+```
 
 ```sh
 # Square dead-zone of 8 counts (default size)
@@ -131,8 +138,31 @@ sudo udevadm trigger
 | `--poll` | `0x1D018D45`, `0x1D018D5E`, `0x1D018D77` | USB `bInterval` for EP81, EP82 (pen) and EP83 set to 1 ms. |
 | `--hover-hold N` | `0x1D007C20`, `0x1D007CEC`, `0x1D007DB8` | The three hover-branch threshold loads (`lbu a0`) become `addiu a0,zero,N`. |
 | `--sample-wait N` | `0x1D0182FC` | The `sltiu v0,v0,2` in the ADC sample wait loop becomes `sltiu v0,v0,N`, so the wait goes from 2 ticks to N. |
+| `--adaptive N` | init image `0x1D0186EA`..`0x1D018720` (26 values), startup stores `0x1D019E70`..`0x1D019F24` (26 nops) | Keeps the stock averaging and rewrites its speed tables. See below. |
 | `--smooth N` | `0x1D0099D4` | `lw a2` becomes `addiu a2,zero,N` instead of `addiu a2,zero,1`. |
 | `--flash-fast` | `0x1D007038` (16 bytes) | See below. |
+
+### `--adaptive N`
+
+The stock firmware averages the final position over a window that depends on how far the new reading is from the last output (`d` = |dX|+|dY|, in raw units where 100 = 1 mm; the HID report is 2.05x that). The window is chosen at `0x1D009790`..`0x1D0099D0`: pen down uses ten thresholds T0..T9 (RAM `0xA00000DE`..`F0`) to pick one of eleven windows, hover uses T0, T5, T6, T9 to pick one of five. The live stock values, set by the startup code, are thresholds 100, 150, 200, 250, 300, 400, 600, 1000, 2000, 4000 and pen-down windows 13, 12, 11, 10, 9, 7, 7, 6, 5, 4, 3 (hover 10, 5, 3, 1, 1). Pen noise gives `d` of about 10 to 30, so it always sat in the first bucket (window 13): heavy smoothing and about 1 mm of lag at slow speeds.
+
+The base build forces the window to 1. `--adaptive N` restores the stock averaging code and writes new tables instead: thresholds 20, 30, 40, 60, 80, 120, 180, 280, 440, 700, pen-down windows N at rest stepping down to 1 above `d` = 180, hover N+2 at rest. Because `d` is measured against the lagging output, the window shrinks by itself as soon as the pen really moves.
+
+The tables sit in the RAM init image and the startup code at `0x1D019E70` stores the stock values over them, so the option edits both: the 26 init values are replaced and the 26 stores to those addresses become nops. No code is added.
+
+I ran the real firmware routine (`0x1D0096D8`, speed measure, window selection and average) in a Unicorn emulator on synthetic pen paths with white noise. Window 4, noise sigma 7 raw (about 14 report units, similar to what `xppen-tools monitor` showed):
+
+| Pen speed | Sideways jitter vs raw | Lag (stock: about 1 mm at slow speeds) |
+| --- | --- | --- |
+| still | 0.39x | none |
+| 18 mm/s | 0.46x | 0.10 mm (4.5 ms) |
+| 36 mm/s | 0.50x | 0.16 mm (3.6 ms) |
+| 71 mm/s | 0.56x | 0.23 mm (2.5 ms) |
+| 143 mm/s | 0.67x | 0.32 mm (1.7 ms) |
+
+Hover (sigma 10 raw): 0.40x at rest. A 3 mm jump goes through with no lag. A circle of 3 mm radius at 95 mm/s keeps its radius (299.6 against 300) and its radius ripple halves. The same tables gave 0.35x to 0.42x at rest for noise sigma 4 and 10, so the thresholds do not need tuning to the noise level. N = 3 is lighter, N = 6 is steadier (0.29x at rest, about 10 ms of lag when crawling). At very high speed the window can flip between 1 and 2, which makes the spacing of points along a stroke slightly uneven (the emulator shows 20 to 40 raw units) but does not bend the line.
+
+These are emulator results on synthetic noise, not a tablet measurement. Real pen noise may not be white.
 
 ### `--hover-hold N`
 
@@ -164,16 +194,3 @@ This is inferred from the chip family's documented reset state and has not been 
 ## USB
 
 Full speed (12 Mb/s) allows a minimum polling interval of 1 ms, so the host can read a pen endpoint at most 1000 times a second. The stock 3 ms interval caps it at about 333 reports a second. `--poll` removes that cap. The pen itself produces fewer reports than that, so the scan rate is what limits you.
-
-## Known limits
-
-- **Tested on hardware:** the no-smoothing base with `--square` (default size 8): a still pen held its position and passed no movement under about 8 counts. `--burst 15 --adc-fast --poll` ran at about 330 Hz.
-- **Failed on hardware:** `--settle 8` stopped pen detection (the tablet still enumerated and was recovered by reflashing).
-- **Tested on hardware, no noticeable effect:** `--flash-fast`.
-- **Sample wait:** `--sample-wait 6` and `12` made the shake worse on hardware (user report). `1` is built but untested.
-- **Not tested on hardware:** other dead-zone sizes, `--pressure`, `--settle 12` to `15`, `--smooth`, and `--burst` values other than 15. The dead-zone table values and their order are assumptions.
-- **Scan rate:** the scan stopped getting faster once burst and ADC time were reduced (about 315 to 330 Hz across several settings). The remaining limit is not confirmed. `--flash-fast` was the attempt to find out whether the CPU is the limit; it made no noticeable difference.
-- **Weak signal:** a low `--burst` weakens the pen signal. Watch for jitter at rest, dropouts near the edges or at hover height, and the pen cutting out on light touches.
-- **Pressure** may still be smoothed. Only the X/Y position path was changed.
-- **Out-of-area samples:** two or more bad readings in a row can still cause a short dropout.
-- **IC check:** the IC number was not read from the tablet in normal mode. `xppen-tools info` in the bootloader confirms it.
